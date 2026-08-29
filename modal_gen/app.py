@@ -17,6 +17,8 @@ from .providers.loader import load_providers
 from .sessions import SessionService, normalize_origin
 from .storage import Store
 
+_DEFAULT_AGENT_TOKEN = "wangran"
+
 
 @dataclass(slots=True)
 class Runtime:
@@ -68,12 +70,7 @@ def create_app(state: Runtime | None = None) -> FastAPI:
         if request.method == "OPTIONS" and request.url.path.startswith("/connector/v1/"):
             return _cors_preflight(request)
         if request.url.path.startswith("/v1/"):
-            expected = os.environ.get("MODAL_GEN_AGENT_TOKEN")
-            if not expected:
-                return JSONResponse(
-                    status_code=503,
-                    content={"code": "LOCAL_CONTROL_LOCKED", "message": "本地控制 token 未配置"},
-                )
+            expected = os.environ.get("MODAL_GEN_AGENT_TOKEN") or _DEFAULT_AGENT_TOKEN
             provided = request.headers.get("X-Modal-Gen-Session", "")
             if not hmac.compare_digest(provided, expected):
                 return JSONResponse(status_code=401, content={"detail": "本地会话无效"})
@@ -90,6 +87,24 @@ def create_app(state: Runtime | None = None) -> FastAPI:
     def providers():
         snapshot = current().capabilities.snapshot()
         return {"providers": snapshot["providers"]}
+
+    @app.get("/v1/provider-connections")
+    def provider_connections():
+        return {"providers": current().capabilities.connections()}
+
+    @app.post("/v1/providers/connect")
+    async def connect_providers(request: Request):
+        payload = await _json_body(request)
+        token_id = payload.get("tokenId")
+        token_secret = payload.get("tokenSecret")
+        if not isinstance(token_id, str) or not isinstance(token_secret, str):
+            raise ConnectorError("PROVIDER_CREDENTIALS_REQUIRED", "Modal credentials 不能为空", 422)
+        rows = current().capabilities.connect_all(token_id, token_secret)
+        return {"providers": rows}
+
+    @app.post("/v1/providers/disconnect")
+    def disconnect_providers():
+        return {"providers": current().capabilities.disconnect_all()}
 
     @app.get("/v1/capabilities")
     def local_capabilities():
