@@ -16,6 +16,15 @@ class ProviderArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectorArtifactDescriptor:
+    id: str
+    role: str
+    mime: str
+    bytes: int
+    hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorArtifactInput:
     id: str
     role: str
@@ -26,6 +35,14 @@ class ConnectorArtifactInput:
 
 
 class ArtifactResolver(Protocol):
+    def describe_input(
+        self,
+        artifact_id: str,
+        *,
+        owner_client: str,
+        owner_origin: str,
+    ) -> ConnectorArtifactDescriptor: ...
+
     def resolve_input(
         self,
         artifact_id: str,
@@ -61,6 +78,7 @@ class ProviderAdapter(Protocol):
     def connection_status(self) -> dict[str, object]: ...
     def connect(self, token_id: str, token_secret: str) -> dict[str, object]: ...
     def disconnect(self) -> dict[str, object]: ...
+    def deployment_manifest(self) -> Mapping[str, object]: ...
 
     def submit(
         self,
@@ -90,6 +108,7 @@ class LibraryProvider(Protocol):
     def connection_status(self) -> Mapping[str, object]: ...
     def connect(self, token_id: str, token_secret: str) -> Mapping[str, object]: ...
     def disconnect(self) -> Mapping[str, object]: ...
+    def deployment_manifest(self) -> Mapping[str, object]: ...
 
     def submit(
         self,

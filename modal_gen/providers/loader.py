@@ -63,6 +63,22 @@ class LibraryProviderAdapter:
             ) from exc
         return {"id": self.id, **value}
 
+    async def connect_async(self, token_id: str, token_secret: str) -> dict[str, object]:
+        try:
+            connect_async = getattr(self.provider, "connect_async", None)
+            if callable(connect_async):
+                value = dict(await connect_async(token_id, token_secret))
+            else:
+                value = dict(self.provider.connect(token_id, token_secret))
+        except Exception as exc:
+            detail = type(exc).__name__
+            raise ProviderError(
+                "PROVIDER_CONNECTION_FAILED",
+                f"{self.id} 连接 Modal 失败 ({detail})",
+                502,
+            ) from exc
+        return {"id": self.id, **value}
+
     def disconnect(self) -> dict[str, object]:
         try:
             value = dict(self.provider.disconnect())
@@ -74,6 +90,17 @@ class LibraryProviderAdapter:
                 502,
             ) from exc
         return {"id": self.id, **value}
+
+    def deployment_manifest(self) -> dict[str, object]:
+        factory = getattr(self.provider, "deployment_manifest", None)
+        if not callable(factory):
+            return {"provider": self.id, "targets": []}
+        value = dict(factory())
+        if value.get("provider") != self.id or not isinstance(value.get("targets"), list):
+            raise ProviderError(
+                "PROVIDER_DEPLOYMENT_INVALID", "Provider deployment manifest 无效", 502
+            )
+        return value
 
     def submit(
         self,

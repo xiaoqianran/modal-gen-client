@@ -4,11 +4,14 @@ import json
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
 from modal_gen.ui.demo import DemoEngine, build_capability_snapshot, make_glb, make_png
 from modal_gen.ui.server import DemoGateway, Handler
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 # --------------------------------------------------------------------- demo
@@ -124,6 +127,7 @@ def test_server_api_endpoints(ui_server: str) -> None:
     assert _get(ui_server, "bootstrap")["mode"] == "demo"
     assert _get(ui_server, "capabilities")["snapshot"]["providers"]
     assert _get(ui_server, "artifacts")["artifacts"]
+    assert _get(ui_server, "deployments")["providers"][0]["status"] == "current"
     assert _get(ui_server, "jobs?status=all&page=1&page_size=25")["total"] >= 3
 
 
@@ -193,7 +197,7 @@ def test_live_gateway_builds_current_connector_job_contract(monkeypatch) -> None
     snapshot = build_capability_snapshot()
     captured = {}
 
-    def fake_req(method, path, *, json_body=None, headers=None, token=None):
+    def fake_req(method, path, *, json_body=None, headers=None, token=None, **kwargs):
         if path == "/v1/capabilities":
             return snapshot
         if path == "/connector/v1/jobs" and method == "POST":
@@ -232,10 +236,20 @@ if (parseModalTokenCommand("modal token set --token-id only")) process.exit(2);
     subprocess.run(
         ["node", "--input-type=module", "--eval", script],
         check=True,
-        cwd=".",
+        cwd=PROJECT_ROOT,
         capture_output=True,
         text=True,
     )
+
+
+def test_connection_drawer_restores_state_after_connect_request() -> None:
+    source = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_connect.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'connectedNow ? "重新连接 Modal" : "连接 Modal"' in source
+    assert "saveHf.disabled = !connectedNow" in source
+    assert source.count("finally {\n      renderConnectionState();\n    }") >= 2
+    assert 'status.textContent = "Modal 已连接。"' in source
 
 
 def test_live_gateway_uses_longer_timeout_for_provider_connect(monkeypatch) -> None:
@@ -270,9 +284,8 @@ def test_ui_shell_matches_provider_client_studio(ui_server: str) -> None:
 def test_toast_resolves_its_host_before_append() -> None:
     import re
     import subprocess
-    from pathlib import Path
 
-    source = Path("modal_gen/ui/assets/app.js").read_text(encoding="utf-8")
+    source = (PROJECT_ROOT / "modal_gen/ui/assets/app.js").read_text(encoding="utf-8")
     match = re.search(
         r'export function toast\(message, kind = ""\) \{.*?\n\}',
         source,
@@ -299,9 +312,7 @@ if (appended.length !== 1 || appended[0].message !== "connected") process.exit(1
 
 
 def test_jobs_ui_keeps_latest_query_and_valid_first_page() -> None:
-    from pathlib import Path
-
-    source = Path("modal_gen/ui/assets/views/view_jobs.js").read_text(encoding="utf-8")
+    source = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_jobs.js").read_text(encoding="utf-8")
 
     assert "let refreshSeq = 0;" in source
     assert "const requestSeq = ++refreshSeq;" in source
@@ -311,11 +322,265 @@ def test_jobs_ui_keeps_latest_query_and_valid_first_page() -> None:
 
 
 def test_dialog_ui_restores_focus_and_handles_escape() -> None:
-    from pathlib import Path
-
-    source = Path("modal_gen/ui/assets/app.js").read_text(encoding="utf-8")
+    source = (PROJECT_ROOT / "modal_gen/ui/assets/app.js").read_text(encoding="utf-8")
 
     assert "const previousFocus = document.activeElement;" in source
     assert 'if (event.key === "Escape")' in source
     assert "previousFocus.focus()" in source
     assert "cancel.focus();" in source
+
+
+def test_live_gateway_bypasses_environment_proxy(monkeypatch) -> None:
+    import httpx
+
+    from modal_gen.ui.server import LiveGateway
+
+    captured = {}
+
+    def fake_request(method, url, **kwargs):
+        captured.update({"method": method, "url": url, **kwargs})
+        request = httpx.Request(method, url)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    monkeypatch.setattr(httpx, "request", fake_request)
+    result = LiveGateway()._req("GET", "/health")
+
+    assert result == {"ok": True}
+    assert captured["trust_env"] is False
+
+
+class _DisconnectingWriter:
+    def __init__(self, exc: OSError) -> None:
+        self.exc = exc
+
+    def write(self, _data: bytes) -> None:
+        raise self.exc
+
+
+def test_ui_response_write_ignores_client_disconnects():
+    from modal_gen.ui.server import Handler
+
+    handler = object.__new__(Handler)
+    for exc in (
+        BrokenPipeError(),
+        ConnectionAbortedError(),
+        ConnectionResetError(),
+    ):
+        handler.wfile = _DisconnectingWriter(exc)
+        handler._write_body(b"payload")
+
+
+def test_demo_gateway_artifacts_are_paginated() -> None:
+    gateway = DemoGateway()
+    first = gateway.artifacts(page=1, page_size=1)
+    second = gateway.artifacts(page=2, page_size=1)
+    assert first["pageSize"] == 1
+    assert first["total"] >= 1
+    assert len(first["artifacts"]) == 1
+    if first["total"] == 1:
+        assert second["artifacts"] == []
+    else:
+        assert second["artifacts"][0]["id"] != first["artifacts"][0]["id"]
+
+
+def test_live_gateway_capability_snapshot_uses_short_ui_cache(monkeypatch) -> None:
+    from modal_gen.ui.server import LiveGateway
+
+    gateway = LiveGateway()
+    snapshot = build_capability_snapshot()
+    calls = []
+
+    def fake_req(method, path, **kwargs):
+        calls.append((method, path))
+        return snapshot
+
+    monkeypatch.setattr(gateway, "_req", fake_req)
+    assert gateway.capabilities()["cached"] is False
+    assert gateway.capabilities()["cached"] is True
+    assert gateway.capabilities(force=True)["cached"] is False
+    assert calls == [("GET", "/v1/capabilities"), ("GET", "/v1/capabilities?refresh=1")]
+
+
+def test_live_gateway_jobs_only_refreshes_visible_page(monkeypatch) -> None:
+    from modal_gen.ui.server import LiveGateway
+
+    gateway = LiveGateway()
+    gateway.token = "session-token"
+    rows = [
+        {
+            "id": f"job_{i}",
+            "status": "running",
+            "operation": "generate",
+            "updatedAt": f"2026-08-31T00:00:0{i}Z",
+            "model": {"id": "m"},
+        }
+        for i in range(4)
+    ]
+    detail_calls = []
+
+    def fake_req(method, path, **kwargs):
+        if path.startswith("/connector/v1/jobs?"):
+            return {"jobs": [rows[2]], "total": len(rows)}
+        detail_calls.append(path)
+        job_id = path.rsplit("/", 1)[-1]
+        return {"job": next(item for item in rows if item["id"] == job_id)}
+
+    monkeypatch.setattr(gateway, "_req", fake_req)
+    result = gateway.jobs(page=2, page_size=1)
+    assert result["total"] == 4
+    assert [item["id"] for item in result["jobs"]] == ["job_2"]
+    assert detail_calls == ["/connector/v1/jobs/job_2"]
+
+
+def test_live_gateway_artifacts_pages_without_remote_job_refresh(monkeypatch) -> None:
+    from modal_gen.ui.server import LiveGateway
+
+    gateway = LiveGateway()
+    gateway.token = "session-token"
+    artifact = {
+        "id": "art_new",
+        "role": "primary-image",
+        "mime": "image/png",
+        "bytes": 10,
+        "hash": "sha256:a",
+        "jobId": "job_new",
+        "updatedAt": "2026-08-31T00:00:02Z",
+        "model": "image-model",
+    }
+    calls = []
+
+    def fake_req(method, path, **kwargs):
+        calls.append(path)
+        assert path.startswith("/connector/v1/artifacts?")
+        return {"artifacts": [artifact], "total": 2}
+
+    monkeypatch.setattr(gateway, "_req", fake_req)
+    result = gateway.artifacts(page=1, page_size=1)
+    assert result["total"] == 2
+    assert result["artifacts"][0]["id"] == "art_new"
+    assert result["artifacts"][0]["model"] == "image-model"
+    assert len(calls) == 1
+
+
+def test_generation_studio_ui_has_batch_prompt_and_lazy_glb_viewer() -> None:
+    create_source = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_create.js").read_text(
+        encoding="utf-8"
+    )
+    artifact_source = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_artifacts.js").read_text(
+        encoding="utf-8"
+    )
+    index = (PROJECT_ROOT / "modal_gen/ui/assets/index.html").read_text(encoding="utf-8")
+
+    assert "一行一个 Prompt" in create_source
+    assert "parsePromptLines" in create_source
+    submit_source = create_source.split("const onSubmit", 1)[1].split(
+        "function renderSourcePicker", 1
+    )[0]
+    assert 'location.hash = "#/jobs"' not in submit_source
+    assert "page_size=8" in create_source
+    assert 'h("model-viewer"' in artifact_source
+    assert 'removeAttribute("src")' in artifact_source
+    assert "PAGE_SIZE = 12" in artifact_source
+    assert (
+        'import("https://ajax.googleapis.com/ajax/libs/model-viewer/4.3.1/model-viewer.min.js")'
+        in artifact_source
+    )
+    assert "model-viewer/4.3.1/model-viewer.min.js" not in index
+
+
+def test_ui_surfaces_deployed_but_blocked_models() -> None:
+    connect = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_connect.js").read_text(
+        encoding="utf-8"
+    )
+    create = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_create.js").read_text(encoding="utf-8")
+    presenter = (PROJECT_ROOT / "modal_gen/ui/assets/runtime_presenter.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "capabilityModels" in connect
+    assert "runtime_presenter.js" in connect
+    assert "unavailableProviderPanel" in create
+    assert "runtime_presenter.js" in create
+    assert 'return capability?.status === "available";' in presenter
+    assert "已部署" in presenter
+    assert "版本过旧" in presenter
+
+
+def test_runtime_ui_exposes_explicit_force_redeploy() -> None:
+    source = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_connect.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert "重新部署 2D + 3D" in source
+    assert "force: true" in source
+    assert 'strategy: "rolling"' in source
+    assert 'app.status === "current"' in source
+    assert 'strategy: "rolling"' in source
+
+
+def test_live_gateway_submit_retries_timeout_with_same_identity(monkeypatch) -> None:
+    from modal_gen.ui.server import LiveGateway
+
+    gateway = LiveGateway()
+    gateway.token = "session-token"
+    snapshot = build_capability_snapshot()
+    attempts = []
+
+    def fake_req(method, path, **kwargs):
+        if path == "/v1/capabilities":
+            return snapshot
+        if path == "/connector/v1/jobs" and method == "POST":
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                raise RuntimeError("connector unreachable: timed out")
+            return {"job": {"id": "job_retry", "status": "accepted"}}
+        raise AssertionError((method, path, kwargs))
+
+    monkeypatch.setattr(gateway, "_req", fake_req)
+    row = gateway.submit(
+        "modal-2d",
+        "modal-2d.image.text_to_image.v1",
+        {"prompt": "test", "model": "sana-sprint-0.6b"},
+    )
+
+    assert row["id"] == "job_retry"
+    assert len(attempts) == 2
+    assert attempts[0]["timeout"] == attempts[1]["timeout"] == 20.0
+    assert attempts[0]["json_body"]["idempotencyKey"] == attempts[1]["json_body"]["idempotencyKey"]
+
+
+def test_live_gateway_force_refresh_and_redeploy_are_forwarded(monkeypatch) -> None:
+    from modal_gen.ui.server import LiveGateway
+
+    gateway = LiveGateway()
+    calls = []
+
+    def fake_req(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"providers": []} if method == "GET" else {"job": {"id": "dep_1"}}
+
+    monkeypatch.setattr(gateway, "_req", fake_req)
+    gateway.deployments(force=True)
+    gateway.deploy("modal-3d", "modal-3d-rembg", force=True, strategy="rolling")
+
+    assert calls[0][1] == "/v1/deployments?refresh=1"
+    assert calls[1][2]["json_body"] == {
+        "provider": "modal-3d",
+        "missingOnly": False,
+        "force": True,
+        "strategy": "rolling",
+        "app": "modal-3d-rembg",
+    }
+
+
+def test_runtime_ui_exposes_resync_and_model_value_sync() -> None:
+    connect = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_connect.js").read_text(
+        encoding="utf-8"
+    )
+    create = (PROJECT_ROOT / "modal_gen/ui/assets/views/view_create.js").read_text(encoding="utf-8")
+
+    assert "重新同步状态" in connect
+    assert 'apiGet("deployments?refresh=1")' in connect
+    assert "loadCapabilities({ refresh: true })" in connect
+    assert "values[key] = readFieldControl(ref.control, ref.spec)" in create
+    assert "required && spec.enum.length === 1" in create

@@ -20,9 +20,10 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from ..identity import idempotency_key, request_hash
 from .demo import DemoEngine, build_capability_snapshot
@@ -63,8 +64,9 @@ class DemoGateway:
     def bootstrap(self) -> dict:
         return {"mode": "demo", "connector": {"id": "unified-connector", "version": "0.1.0"}}
 
-    def capabilities(self) -> dict:
-        return {"snapshot": self.engine.capabilities(), "stale": False}
+    def capabilities(self, *, force: bool = False) -> dict:
+        del force
+        return {"snapshot": self.engine.capabilities(), "stale": False, "cached": False}
 
     def pairings(self) -> dict:
         return {"pairings": self.engine.list_pairings()}
@@ -91,6 +93,59 @@ class DemoGateway:
         self._connected = False
         return self.connections()
 
+    def deployments(self, *, force: bool = False) -> dict:
+        del force
+        return {
+            "providers": [
+                {"id": "modal-2d", "status": "current", "apps": []},
+                {"id": "modal-3d", "status": "current", "apps": []},
+            ]
+        }
+
+    def huggingface_secret(self) -> dict:
+        return {"connected": True, "configured": True, "secrets": []}
+
+    def save_huggingface_secret(self, _token: str) -> dict:
+        return self.huggingface_secret()
+
+    def deploy(
+        self,
+        provider: str = "all",
+        app_name: str | None = None,
+        *,
+        missing_only: bool = False,
+        force: bool = False,
+        strategy: str = "rolling",
+    ) -> dict:
+        rows = self.deployments()
+        selected = (
+            rows["providers"]
+            if provider == "all"
+            else [row for row in rows["providers"] if row["id"] == provider]
+        )
+        if app_name:
+            for row in selected:
+                row["apps"] = [item for item in row.get("apps", []) if item.get("app") == app_name]
+        job = {
+            "id": "dep_demo",
+            "status": "succeeded",
+            "provider": provider,
+            "app": app_name,
+            "missingOnly": missing_only,
+            "force": force,
+            "strategy": strategy,
+            "result": {"providers": selected},
+        }
+        return {"job": job}
+
+    def deployment_jobs(self, limit: int = 20) -> dict:
+        return {"jobs": []}
+
+    def deployment_job(self, job_id: str) -> dict:
+        if job_id != "dep_demo":
+            raise RuntimeError("deployment job not found")
+        return self.deploy()["job"]
+
     def jobs(self, status=None, q="", page=1, page_size=25) -> dict:
         return self.engine.list_jobs(status=status, q=q, page=page, page_size=page_size)
 
@@ -107,11 +162,22 @@ class DemoGateway:
             raise KeyError("unknown job")
         return row
 
-    def artifacts(self) -> dict:
+    def artifacts(self, *, page: int = 1, page_size: int = 12, mime: str | None = None) -> dict:
         items = [
             {k: v for k, v in a.items() if k != "_bytes"} for a in self.engine.list_artifacts()
         ]
-        return {"artifacts": items}
+        if mime:
+            items = [item for item in items if item.get("mime") == mime]
+        total = len(items)
+        page = max(1, page)
+        page_size = max(1, min(page_size, 48))
+        start = (page - 1) * page_size
+        return {
+            "artifacts": items[start : start + page_size],
+            "page": page,
+            "pageSize": page_size,
+            "total": total,
+        }
 
     def artifact_content(self, artifact_id: str) -> tuple[bytes, str] | None:
         data = self.engine.artifact_bytes(artifact_id)
@@ -132,6 +198,8 @@ class LiveGateway:
         self.token: str | None = None
         self.session_data: dict | None = None
         self.snapshot: dict | None = None
+        self._snapshot_at = 0.0
+        self._snapshot_ttl_s = 30.0
         self._lock = threading.Lock()
 
     # -- low level ---------------------------------------------------------- #
@@ -156,7 +224,13 @@ class LiveGateway:
             hdrs["Content-Type"] = "application/json"
         try:
             resp = httpx.request(
-                method, url, json=json_body, headers=hdrs, timeout=timeout, follow_redirects=False
+                method,
+                url,
+                json=json_body,
+                headers=hdrs,
+                timeout=timeout,
+                follow_redirects=False,
+                trust_env=False,
             )
         except httpx.RequestError as exc:
             raise RuntimeError(f"connector unreachable: {exc}") from exc
@@ -178,14 +252,23 @@ class LiveGateway:
             return {"mode": "live", "connector": None, "reachable": False}
         return {"mode": "live", "connector": health.get("connector"), "reachable": True}
 
-    def capabilities(self) -> dict:
+    def capabilities(self, *, force: bool = False) -> dict:
+        now = time.monotonic()
+        if (
+            not force
+            and self.snapshot is not None
+            and now - self._snapshot_at < self._snapshot_ttl_s
+        ):
+            return {"snapshot": self.snapshot, "stale": False, "cached": True}
         snap = self._req(
             "GET",
-            "/v1/capabilities",
+            f"/v1/capabilities{'?refresh=1' if force else ''}",
             headers={"X-Modal-Gen-Session": _CONNECTOR_TOKEN},
+            timeout=30.0 if force else 5.0,
         )
         self.snapshot = snap
-        return {"snapshot": snap, "stale": False}
+        self._snapshot_at = now
+        return {"snapshot": snap, "stale": False, "cached": False}
 
     def connections(self) -> dict:
         return self._req(
@@ -205,6 +288,7 @@ class LiveGateway:
         self.token = None
         self.session_data = None
         self.snapshot = None
+        self._snapshot_at = 0.0
         return result
 
     def disconnect_providers(self) -> dict:
@@ -216,7 +300,74 @@ class LiveGateway:
         self.token = None
         self.session_data = None
         self.snapshot = None
+        self._snapshot_at = 0.0
         return result
+
+    def deployments(self, *, force: bool = False) -> dict:
+        return self._req(
+            "GET",
+            f"/v1/deployments{'?refresh=1' if force else ''}",
+            headers={"X-Modal-Gen-Session": _CONNECTOR_TOKEN},
+            timeout=30.0,
+        )
+
+    def huggingface_secret(self) -> dict:
+        return self._req(
+            "GET",
+            "/v1/secrets/huggingface",
+            headers={"X-Modal-Gen-Session": _CONNECTOR_TOKEN},
+            timeout=30.0,
+        )
+
+    def save_huggingface_secret(self, token: str) -> dict:
+        return self._req(
+            "POST",
+            "/v1/secrets/huggingface",
+            json_body={"token": token},
+            headers={"X-Modal-Gen-Session": _CONNECTOR_TOKEN},
+            timeout=30.0,
+        )
+
+    def deploy(
+        self,
+        provider: str = "all",
+        app_name: str | None = None,
+        *,
+        missing_only: bool = False,
+        force: bool = False,
+        strategy: str = "rolling",
+    ) -> dict:
+        body = {
+            "provider": provider,
+            "missingOnly": missing_only,
+            "force": force,
+            "strategy": strategy,
+        }
+        if app_name:
+            body["app"] = app_name
+        return self._req(
+            "POST",
+            "/v1/deployments/deploy",
+            json_body=body,
+            headers={"X-Modal-Gen-Session": _CONNECTOR_TOKEN},
+            timeout=10.0,
+        )
+
+    def deployment_jobs(self, limit: int = 20) -> dict:
+        return self._req(
+            "GET",
+            f"/v1/deployments/jobs?limit={limit}",
+            headers={"X-Modal-Gen-Session": _CONNECTOR_TOKEN},
+            timeout=10.0,
+        )
+
+    def deployment_job(self, job_id: str) -> dict:
+        return self._req(
+            "GET",
+            f"/v1/deployments/jobs/{job_id}",
+            headers={"X-Modal-Gen-Session": _CONNECTOR_TOKEN},
+            timeout=10.0,
+        )["job"]
 
     def pairings(self) -> dict:
         snap = self._req("GET", "/v1/pairings", headers={"X-Modal-Gen-Session": _CONNECTOR_TOKEN})
@@ -268,11 +419,22 @@ class LiveGateway:
 
     def jobs(self, status=None, q="", page=1, page_size=25) -> dict:
         self._ensure_session()
-        data = self._req("GET", "/connector/v1/jobs", token=self.token)
-        rows = data.get("jobs", [])
+        page = max(1, page)
+        page_size = max(1, min(page_size, 100))
+        params: dict[str, object] = {
+            "limit": page_size,
+            "offset": (page - 1) * page_size,
+        }
+        if status and status != "all":
+            params["status"] = status
+        if q:
+            params["q"] = q
+        data = self._req("GET", f"/connector/v1/jobs?{urlencode(params)}", token=self.token)
+        visible = list(data.get("jobs", []))
+        total = int(data.get("total", len(visible)))
         terminal = {"succeeded", "failed", "cancelled", "expired"}
-        refreshed = []
-        for row in rows:
+        refreshed: list[dict] = []
+        for row in visible:
             if row.get("status") in terminal:
                 refreshed.append(row)
                 continue
@@ -281,21 +443,7 @@ class LiveGateway:
                 refreshed.append(payload.get("job") or row)
             except RuntimeError:
                 refreshed.append(row)
-        rows = refreshed
-        # filter/sort/paginate client-side for simplicity
-        if status and status != "all":
-            rows = [r for r in rows if r.get("status") == status]
-        if q:
-            needle = q.lower()
-            rows = [
-                r
-                for r in rows
-                if needle in r["id"].lower() or needle in str(r.get("operation") or "").lower()
-            ]
-        rows.sort(key=lambda r: str(r.get("updatedAt") or ""), reverse=True)
-        total = len(rows)
-        start = (page - 1) * page_size
-        return {"jobs": rows[start : start + page_size], "page": page, "total": total}
+        return {"jobs": refreshed, "page": page, "pageSize": page_size, "total": total}
 
     def job(self, job_id: str) -> dict | None:
         self._ensure_session()
@@ -342,7 +490,27 @@ class LiveGateway:
         body["requestHash"] = request_hash(body)
         body["idempotencyKey"] = idempotency_key(body)
         self._ensure_session()
-        payload = self._req("POST", "/connector/v1/jobs", json_body=body, token=self.token)
+        try:
+            payload = self._req(
+                "POST",
+                "/connector/v1/jobs",
+                json_body=body,
+                token=self.token,
+                timeout=20.0,
+            )
+        except RuntimeError as exc:
+            # Submission is idempotent. A timeout after the Connector accepted the
+            # request is an unknown outcome, not a safe reason to report failure.
+            # Retry once with the exact same idempotency key to recover the result.
+            if "timed out" not in str(exc).lower():
+                raise
+            payload = self._req(
+                "POST",
+                "/connector/v1/jobs",
+                json_body=body,
+                token=self.token,
+                timeout=20.0,
+            )
         return payload.get("job") if isinstance(payload, dict) else payload
 
     def cancel(self, job_id: str) -> dict:
@@ -350,14 +518,23 @@ class LiveGateway:
         payload = self._req("POST", f"/connector/v1/jobs/{job_id}/cancel", token=self.token)
         return payload.get("job") if isinstance(payload, dict) else payload
 
-    def artifacts(self) -> dict:
-        # derive from jobs' result.artifacts (connector exposes per artifact content)
-        seen: dict[str, dict] = {}
-        rows = self.jobs(page_size=200).get("jobs", [])
-        for job in rows:
-            for art in (job.get("result") or {}).get("artifacts", []):
-                seen[art["id"]] = {**art, "jobId": job["id"]}
-        return {"artifacts": list(seen.values())}
+    def artifacts(self, *, page: int = 1, page_size: int = 12, mime: str | None = None) -> dict:
+        self._ensure_session()
+        page = max(1, page)
+        page_size = max(1, min(page_size, 48))
+        params: dict[str, object] = {
+            "limit": page_size,
+            "offset": (page - 1) * page_size,
+        }
+        if mime:
+            params["mime"] = mime
+        data = self._req("GET", f"/connector/v1/artifacts?{urlencode(params)}", token=self.token)
+        return {
+            "artifacts": list(data.get("artifacts", [])),
+            "page": page,
+            "pageSize": page_size,
+            "total": int(data.get("total", 0)),
+        }
 
     def artifact_content(self, artifact_id: str) -> tuple[bytes, str] | None:
         self._ensure_session()
@@ -368,6 +545,7 @@ class LiveGateway:
                 f"{_CONNECTOR_URL}/connector/v1/artifacts/{artifact_id}",
                 headers={"Authorization": f"Bearer {self.token}", "Origin": _CLIENT_ORIGIN},
                 timeout=30.0,
+                trust_env=False,
             )
             if resp.status_code != 200:
                 return None
@@ -398,7 +576,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
+
+    def _write_body(self, data: bytes) -> None:
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def _cors_headers(self):
         """Reflect the caller's Origin, or `*` when wildcard mode is enabled."""
@@ -431,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self._write_body(data)
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -468,19 +652,44 @@ class Handler(BaseHTTPRequestHandler):
         if name == "bootstrap":
             return self._send_json(g.bootstrap())
         if name == "capabilities":
-            return self._send_json(g.capabilities())
+            params = parse_qs(query)
+            force = params.get("refresh", ["0"])[0] in {"1", "true", "yes"}
+            return self._send_json(g.capabilities(force=force))
         if name == "pairings":
             return self._send_json(g.pairings())
         if name == "connections":
             return self._send_json(g.connections())
+        if name == "deployments":
+            try:
+                params = parse_qs(query)
+                force = params.get("refresh", ["0"])[0] in {"1", "true", "yes"}
+                return self._send_json(g.deployments(force=force))
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, 409)
+        if name == "secrets/huggingface":
+            try:
+                return self._send_json(g.huggingface_secret())
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, 502)
+        if name == "deployments/jobs":
+            try:
+                return self._send_json(g.deployment_jobs())
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, 502)
+        if name.startswith("deployments/jobs/"):
+            try:
+                job_id = name[len("deployments/jobs/") :]
+                return self._send_json({"job": g.deployment_job(job_id)})
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, 502)
         if name == "jobs":
-            params = dict(p.split("=") for p in query.split("&") if "=" in p)
+            params = parse_qs(query)
             return self._send_json(
                 g.jobs(
-                    status=params.get("status", "all"),
-                    q=params.get("q", ""),
-                    page=int(params.get("page", "1")),
-                    page_size=int(params.get("page_size", "25")),
+                    status=params.get("status", ["all"])[0],
+                    q=params.get("q", [""])[0],
+                    page=int(params.get("page", ["1"])[0]),
+                    page_size=int(params.get("page_size", ["25"])[0]),
                 )
             )
         if name.startswith("jobs/"):
@@ -490,7 +699,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": "not_found"}, 404)
             return self._send_json({"job": row})
         if name == "artifacts":
-            return self._send_json(g.artifacts())
+            params = parse_qs(query)
+            return self._send_json(
+                g.artifacts(
+                    page=int(params.get("page", ["1"])[0]),
+                    page_size=int(params.get("page_size", ["12"])[0]),
+                    mime=params.get("mime", [None])[0],
+                )
+            )
         if name.startswith("artifacts/") and name.endswith("/content"):
             artifact_id = name[len("artifacts/") : -len("/content")]
             result = g.artifact_content(artifact_id)
@@ -501,9 +717,16 @@ class Handler(BaseHTTPRequestHandler):
             self._cors_headers()
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", f'attachment; filename="{artifact_id}.bin"')
+            extension = (
+                "png"
+                if mime.startswith("image/")
+                else "glb"
+                if mime == "model/gltf-binary"
+                else "bin"
+            )
+            self.send_header("Content-Disposition", f'inline; filename="{artifact_id}.{extension}"')
             self.end_headers()
-            self.wfile.write(data)
+            self._write_body(data)
             return
         self.send_error(404)
 
@@ -523,6 +746,24 @@ class Handler(BaseHTTPRequestHandler):
         if name == "providers/disconnect":
             try:
                 return self._send_json(g.disconnect_providers())
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, 502)
+        if name == "secrets/huggingface":
+            try:
+                return self._send_json(g.save_huggingface_secret(body.get("token", "")))
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, 502)
+        if name == "deployments/deploy":
+            try:
+                return self._send_json(
+                    g.deploy(
+                        body.get("provider", "all"),
+                        body.get("app"),
+                        missing_only=bool(body.get("missingOnly", False)),
+                        force=bool(body.get("force", False)),
+                        strategy=str(body.get("strategy") or "rolling"),
+                    )
+                )
             except RuntimeError as exc:
                 return self._send_json({"error": str(exc)}, 502)
         if name == "jobs":
@@ -561,7 +802,10 @@ def main() -> None:
             "警告：已启用 MODAL_GEN_ALLOW_ANY_ORIGIN，任意站点可跨域调用本机接口。",
             file=sys.stderr,
         )
-    print(f"modal-gen console on http://{host}:{_PORT}/  (mode={_MODE})")
+    local_url = f"http://localhost:{_PORT}/"
+    print(f"modal-gen console on {local_url}  (mode={_MODE})")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        print(f"modal-gen console listening on http://{host}:{_PORT}/")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
