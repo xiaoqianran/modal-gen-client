@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,10 +81,25 @@ def create_app(state: Runtime | None = None) -> FastAPI:
             target.capabilities.disconnect_all()
             _LOG.warning("无法自动恢复已保存的 Modal 凭据: %s", exc)
 
+    restore_task: asyncio.Task[None] | None = None
+
+    async def stop_credential_restore() -> None:
+        nonlocal restore_task
+        task, restore_task = restore_task, None
+        if task is None or task.done():
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        await restore_saved_credentials()
-        yield
+        nonlocal restore_task
+        restore_task = asyncio.create_task(restore_saved_credentials())
+        try:
+            yield
+        finally:
+            await stop_credential_restore()
 
     app = FastAPI(
         title="modal-gen Connector",
@@ -129,6 +145,7 @@ def create_app(state: Runtime | None = None) -> FastAPI:
 
     @app.post("/v1/providers/connect")
     async def connect_providers(request: Request):
+        await stop_credential_restore()
         payload = await _json_body(request)
         token_id = payload.get("tokenId")
         token_secret = payload.get("tokenSecret")
@@ -140,8 +157,16 @@ def create_app(state: Runtime | None = None) -> FastAPI:
             credentials.save(token_id, token_secret)
         return {"providers": rows}
 
+    @app.post("/v1/providers/connect-local-profile")
+    async def connect_providers_local_profile():
+        await stop_credential_restore()
+        await current().deployments.connect_default_async()
+        rows = await current().capabilities.connect_all_default_async()
+        return {"providers": rows, "credentialSource": "modal-profile"}
+
     @app.post("/v1/providers/disconnect")
-    def disconnect_providers():
+    async def disconnect_providers():
+        await stop_credential_restore()
         current().deployments.disconnect()
         rows = current().capabilities.disconnect_all()
         return {"providers": rows}
@@ -202,7 +227,8 @@ def create_app(state: Runtime | None = None) -> FastAPI:
         missing_only = payload.get("missingOnly", False)
         if not isinstance(missing_only, bool):
             raise ConnectorError("DEPLOYMENT_MISSING_ONLY_INVALID", "missingOnly 必须是布尔值", 422)
-        job = current().deployments.start_deploy(
+        job = await run_in_threadpool(
+            current().deployments.start_deploy,
             provider,
             app_name=app_name,
             strategy=strategy,
@@ -227,7 +253,14 @@ def create_app(state: Runtime | None = None) -> FastAPI:
     @app.post(SESSION_PATH)
     async def pair_session(request: Request):
         payload = await _json_body(request)
-        return current().sessions.pair(payload, request_origin=request.headers.get("origin"))
+        capability_snapshot = None
+        if payload.get("pairingId"):
+            capability_snapshot = await current().capabilities.snapshot_async(force_runtime=True)
+        return current().sessions.pair(
+            payload,
+            request_origin=request.headers.get("origin"),
+            capability_snapshot=capability_snapshot,
+        )
 
     @app.delete(SESSION_PATH)
     def revoke_session(request: Request):

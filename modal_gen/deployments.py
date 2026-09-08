@@ -39,6 +39,8 @@ class DeploymentTarget:
     models: tuple[str, ...] = ()
     required: bool = False
     weights: tuple[WeightSpec, ...] = ()
+    prerequisites: tuple[WeightSpec, ...] = ()
+    secrets: tuple[str, ...] = ()
 
 
 def _now() -> str:
@@ -106,6 +108,7 @@ class DeploymentService:
             (target.provider, target.app_name): threading.Lock() for target in self._targets_all
         }
         self._weights = WeightProvisioner()
+        self._prerequisites = WeightProvisioner()
         self._jobs: dict[str, dict[str, object]] = {}
         self._active_requests: dict[tuple[object, ...], str] = {}
         self._job_request_keys: dict[str, tuple[object, ...]] = {}
@@ -149,6 +152,14 @@ class DeploymentService:
                     if isinstance(raw_models, list)
                     else ()
                 )
+                raw_secrets = item.get("secrets", [])
+                if not isinstance(raw_secrets, list) or any(
+                    not isinstance(value, str) or not value.strip() for value in raw_secrets
+                ):
+                    raise ConnectorError(
+                        "DEPLOYMENT_MANIFEST_INVALID", "Runtime secrets 必须是非空字符串数组", 500
+                    )
+                secrets = tuple(dict.fromkeys(value.strip() for value in raw_secrets))
                 raw_weights = item.get("weights", [])
                 if not isinstance(raw_weights, list):
                     raise ConnectorError(
@@ -161,6 +172,18 @@ class DeploymentService:
                     )
                 except ValueError as exc:
                     raise ConnectorError("DEPLOYMENT_MANIFEST_INVALID", str(exc), 500) from exc
+                raw_prerequisites = item.get("prerequisites", [])
+                if not isinstance(raw_prerequisites, list):
+                    raise ConnectorError(
+                        "DEPLOYMENT_MANIFEST_INVALID", "Runtime prerequisites 必须是数组", 500
+                    )
+                try:
+                    prerequisites = tuple(
+                        WeightSpec.from_manifest(value, default_module=module)
+                        for value in raw_prerequisites
+                    )
+                except ValueError as exc:
+                    raise ConnectorError("DEPLOYMENT_MANIFEST_INVALID", str(exc), 500) from exc
                 rows.append(
                     DeploymentTarget(
                         provider=provider,
@@ -170,6 +193,8 @@ class DeploymentService:
                         models=models,
                         required=item.get("required") is True,
                         weights=weights,
+                        prerequisites=prerequisites,
+                        secrets=secrets,
                     )
                 )
                 seen.add(key)
@@ -186,6 +211,13 @@ class DeploymentService:
         if not token_id.strip() or not token_secret.strip():
             raise ConnectorError("PROVIDER_CREDENTIALS_REQUIRED", "Modal credentials 不能为空", 422)
         client = await modal.Client.from_credentials.aio(token_id.strip(), token_secret.strip())
+        with self._lock:
+            self._client = client
+            self._readiness_cache.clear()
+
+    async def connect_default_async(self) -> None:
+        client = await modal.Client.from_env.aio()
+        await client.hello.aio()
         with self._lock:
             self._client = client
             self._readiness_cache.clear()
@@ -238,6 +270,9 @@ class DeploymentService:
             raise ConnectorError("DEPLOYMENT_PROVIDER_UNKNOWN", f"未知 Provider: {provider}", 422)
         return selected
 
+    def manages_provider(self, provider: str) -> bool:
+        return any(target.provider == provider for target in self._targets_all)
+
     def _select_targets(
         self,
         provider: str | None,
@@ -262,6 +297,26 @@ class DeploymentService:
         client = self._require_client()
         rows = [self._target_status(target, client) for target in self._targets(provider)]
         return self._summary(rows)
+
+    def submission_status(self, provider: str, model: str | None = None) -> dict[str, object]:
+        """Read only the runtime targets required for one submission."""
+
+        client = self._require_client()
+        targets = self._targets(provider)
+        model_targets = tuple(
+            target for target in targets if model is not None and model in target.models
+        )
+        if model is not None and not model_targets:
+            raise ConnectorError("DEPLOYMENT_MODEL_UNKNOWN", f"未知 Runtime 模型: {model}", 422)
+        selected = tuple(
+            dict.fromkeys(
+                target for target in targets if target.required or target in model_targets
+            )
+        )
+        if not selected:
+            selected = targets
+        rows = [self._target_status(target, client) for target in selected]
+        return {"connected": True, **self._summary(rows)}
 
     async def status_async(
         self,
@@ -337,6 +392,20 @@ class DeploymentService:
             providers.append({"id": provider, "status": "disconnected", "apps": apps})
         return {"connected": False, "providers": providers}
 
+    @staticmethod
+    def _ensure_target_secrets(targets: tuple[DeploymentTarget, ...], client: modal.Client) -> None:
+        required = tuple(dict.fromkeys(secret for target in targets for secret in target.secrets))
+        if not required:
+            return
+        existing = _modal_secret_names(client)
+        missing = [name for name in required if name not in existing]
+        if missing:
+            raise ConnectorError(
+                "DEPLOYMENT_SECRETS_REQUIRED",
+                "部署前请先配置 Modal Secrets: " + ", ".join(missing),
+                409,
+            )
+
     def deploy(
         self,
         provider: str | None = None,
@@ -362,6 +431,7 @@ class DeploymentService:
                 for target in targets
             }
             targets = tuple(target for target in targets if statuses[target.app_name] == "missing")
+        self._ensure_target_secrets(targets, client)
 
         rows: list[dict[str, object]] = []
         for target in targets:
@@ -390,6 +460,23 @@ class DeploymentService:
         on_phase=None,
     ) -> dict[str, object]:
         try:
+            prerequisites = self._prerequisites.ensure(
+                target.app_name,
+                target.prerequisites,
+                client,
+                environment_name,
+                on_phase=(
+                    (lambda phase: on_phase(
+                        {
+                            "checking_weights": "checking_prerequisites",
+                            "downloading_weights": "preparing_prerequisites",
+                            "verifying_weights": "verifying_prerequisites",
+                        }.get(phase, phase)
+                    ))
+                    if on_phase is not None
+                    else None
+                ),
+            )
             weights = self._weights.ensure(
                 target.app_name,
                 target.weights,
@@ -421,6 +508,7 @@ class DeploymentService:
                 "deployedRevision": target.revision,
                 "models": list(target.models),
                 "required": target.required,
+                "prerequisites": prerequisites,
                 "weights": weights,
             }
         except Exception as exc:
@@ -541,7 +629,15 @@ class DeploymentService:
                 "force 与 missingOnly 不能同时启用",
                 422,
             )
-        self._select_targets(provider, app_name)
+        targets = self._select_targets(provider, app_name)
+        client = self._require_client()
+        if missing_only:
+            targets = tuple(
+                target
+                for target in targets
+                if self._target_status(target, client, environment_name)["status"] == "missing"
+            )
+        self._ensure_target_secrets(targets, client)
         self._invalidate_readiness_cache()
         request_key = (provider, app_name, strategy, environment_name, missing_only, force)
         with self._lock:
@@ -571,7 +667,6 @@ class DeploymentService:
             self._jobs[job_id] = job
             self._active_requests[request_key] = job_id
             self._job_request_keys[job_id] = request_key
-        client = self._require_client()
         thread = threading.Thread(
             target=self._run_deployment_job,
             args=(
@@ -774,6 +869,22 @@ class DeploymentService:
             status, error = "missing", str(exc)
         except Exception as exc:
             status, error = "error", str(exc)
+
+        prerequisites = None
+        prerequisite_error = None
+        if target.prerequisites:
+            try:
+                prerequisites = await self._prerequisites.status_async(
+                    target.prerequisites, client, environment_name
+                )
+                if prerequisites["status"] != "ready":
+                    prerequisite_error = "required deployment prerequisites are missing"
+            except Exception as exc:
+                prerequisite_error = str(exc)
+        prerequisites_ready = not target.prerequisites or (
+            isinstance(prerequisites, dict) and prerequisites.get("status") == "ready"
+        )
+
         weights = None
         weight_error = None
         if status in {"current", "stale"} and target.weights:
@@ -795,8 +906,12 @@ class DeploymentService:
             "deployedRevision": actual_revision,
             "models": list(target.models),
             "required": target.required,
-            "runnable": status == "current" and weights_ready,
+            "runnable": status == "current" and prerequisites_ready and weights_ready,
         }
+        if prerequisites is not None:
+            row["prerequisites"] = prerequisites
+        if prerequisite_error:
+            row["prerequisiteError"] = prerequisite_error
         if weights is not None:
             row["weights"] = weights
         if weight_error:
@@ -830,6 +945,22 @@ class DeploymentService:
             status, error = "missing", str(exc)
         except Exception as exc:
             status, error = "error", str(exc)
+
+        prerequisites = None
+        prerequisite_error = None
+        if target.prerequisites:
+            try:
+                prerequisites = self._prerequisites.status(
+                    target.prerequisites, client, environment_name
+                )
+                if prerequisites["status"] != "ready":
+                    prerequisite_error = "required deployment prerequisites are missing"
+            except Exception as exc:
+                prerequisite_error = str(exc)
+        prerequisites_ready = not target.prerequisites or (
+            isinstance(prerequisites, dict) and prerequisites.get("status") == "ready"
+        )
+
         weights = None
         weight_error = None
         if status in {"current", "stale"} and target.weights:
@@ -851,8 +982,12 @@ class DeploymentService:
             "deployedRevision": actual_revision,
             "models": list(target.models),
             "required": target.required,
-            "runnable": status == "current" and weights_ready,
+            "runnable": status == "current" and prerequisites_ready and weights_ready,
         }
+        if prerequisites is not None:
+            row["prerequisites"] = prerequisites
+        if prerequisite_error:
+            row["prerequisiteError"] = prerequisite_error
         if weights is not None:
             row["weights"] = weights
         if weight_error:

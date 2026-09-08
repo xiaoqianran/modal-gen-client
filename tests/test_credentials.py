@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -79,3 +80,106 @@ def test_app_restores_saved_credentials_and_new_login_replaces_them(monkeypatch,
     assert saved.token_secret == "as_new"
     assert deployment_connects[-1] == ("ak_new", "as_new")
     assert provider_connects[-1] == ("ak_new", "as_new")
+
+
+def test_manual_login_cancels_background_credential_restore(monkeypatch, tmp_path: Path):
+    path = tmp_path / ".secrets" / "modal.json"
+    CredentialStore(path).save("ak_old", "as_old")
+    monkeypatch.setenv("MODAL_GEN_CREDENTIALS_FILE", str(path))
+
+    restore_started = asyncio.Event()
+    deployment_connects = []
+    provider_connects = []
+
+    class Deployments:
+        async def connect_async(self, token_id, token_secret):
+            deployment_connects.append((token_id, token_secret))
+            if token_id == "ak_old":
+                restore_started.set()
+                await asyncio.Event().wait()
+
+        def disconnect(self):
+            return None
+
+    class Capabilities:
+        async def connect_all_async(self, token_id, token_secret):
+            provider_connects.append((token_id, token_secret))
+            return [{"id": "modal-2d", "connected": True}]
+
+        def disconnect_all(self):
+            return []
+
+    fake_runtime = SimpleNamespace(deployments=Deployments(), capabilities=Capabilities())
+    monkeypatch.setattr(app_module, "runtime", lambda: fake_runtime)
+
+    async def scenario():
+        app = app_module.create_app()
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(restore_started.wait(), timeout=1)
+            route = next(
+                route
+                for route in app.routes
+                if getattr(route, "path", None) == "/v1/providers/connect"
+            )
+            from starlette.requests import Request
+
+            body = b'{"tokenId":"ak_new","tokenSecret":"as_new"}'
+            sent = False
+
+            async def receive():
+                nonlocal sent
+                if sent:
+                    return {"type": "http.disconnect"}
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            request = Request(
+                {"type": "http", "method": "POST", "path": route.path, "headers": []},
+                receive,
+            )
+            response = await route.endpoint(request)
+            assert response["providers"][0]["connected"] is True
+
+    asyncio.run(scenario())
+    assert deployment_connects == [("ak_old", "as_old"), ("ak_new", "as_new")]
+    assert provider_connects == [("ak_new", "as_new")]
+
+
+def test_local_profile_connect_uses_modal_profile_without_persisting_tokens(
+    monkeypatch, tmp_path: Path
+):
+    path = tmp_path / ".secrets" / "modal.json"
+    monkeypatch.setenv("MODAL_GEN_CREDENTIALS_FILE", str(path))
+    calls: list[str] = []
+
+    class Deployments:
+        async def connect_default_async(self):
+            calls.append("deployments")
+
+        def disconnect(self):
+            return None
+
+    class Capabilities:
+        async def connect_all_default_async(self):
+            calls.append("capabilities")
+            return [{"id": "modal-2d", "connected": True}]
+
+        def disconnect_all(self):
+            return []
+
+    fake_runtime = SimpleNamespace(deployments=Deployments(), capabilities=Capabilities())
+    monkeypatch.setattr(app_module, "runtime", lambda: fake_runtime)
+
+    with TestClient(app_module.create_app()) as client:
+        response = client.post(
+            "/v1/providers/connect-local-profile",
+            headers={"X-Modal-Gen-Session": "wangran"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "providers": [{"id": "modal-2d", "connected": True}],
+        "credentialSource": "modal-profile",
+    }
+    assert calls == ["deployments", "capabilities"]
+    assert CredentialStore(path).load() is None

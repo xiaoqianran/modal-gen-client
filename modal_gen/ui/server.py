@@ -413,7 +413,12 @@ class LiveGateway:
             self.session_data = second["session"]
             return second
 
-    def _ensure_session(self) -> None:
+    def _ensure_session(self, snapshot: dict | None = None) -> None:
+        if snapshot is not None and self.token and self.session_data:
+            session_hash = self.session_data.get("capabilityHash")
+            if session_hash != snapshot.get("hash"):
+                self.token = None
+                self.session_data = None
         if not self.token:
             self.session()
 
@@ -439,19 +444,26 @@ class LiveGateway:
                 refreshed.append(row)
                 continue
             try:
-                payload = self._req("GET", f"/connector/v1/jobs/{row['id']}", token=self.token)
+                payload = self._req(
+                    "GET",
+                    f"/connector/v1/jobs/{row['id']}",
+                    token=self.token,
+                    timeout=20.0,
+                )
                 refreshed.append(payload.get("job") or row)
-            except RuntimeError:
-                refreshed.append(row)
+            except RuntimeError as exc:
+                refreshed.append({**row, "syncDelayed": True, "syncError": str(exc)})
         return {"jobs": refreshed, "page": page, "pageSize": page_size, "total": total}
 
     def job(self, job_id: str) -> dict | None:
         self._ensure_session()
-        try:
-            payload = self._req("GET", f"/connector/v1/jobs/{job_id}", token=self.token)
-            return payload.get("job") if isinstance(payload, dict) else None
-        except RuntimeError:
-            return None
+        payload = self._req(
+            "GET",
+            f"/connector/v1/jobs/{job_id}",
+            token=self.token,
+            timeout=20.0,
+        )
+        return payload.get("job") if isinstance(payload, dict) else None
 
     def submit(self, provider: str, operation: str, inputs: dict) -> dict:
         snapshot = self.capabilities()["snapshot"]
@@ -489,7 +501,7 @@ class LiveGateway:
         }
         body["requestHash"] = request_hash(body)
         body["idempotencyKey"] = idempotency_key(body)
-        self._ensure_session()
+        self._ensure_session(snapshot)
         try:
             payload = self._req(
                 "POST",
@@ -694,7 +706,10 @@ class Handler(BaseHTTPRequestHandler):
             )
         if name.startswith("jobs/"):
             job_id = name[len("jobs/") :]
-            row = g.job(job_id)
+            try:
+                row = g.job(job_id)
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, 502)
             if row is None:
                 return self._send_json({"error": "not_found"}, 404)
             return self._send_json({"job": row})

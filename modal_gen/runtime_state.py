@@ -35,7 +35,7 @@ class RuntimeAppState:
             required=item.get("required") is True,
             models=tuple(model for model in item.get("models", []) if isinstance(model, str)),
             weights_status=weights_status,
-            error=item.get("error") or item.get("weightError"),
+            error=item.get("error") or item.get("prerequisiteError") or item.get("weightError"),
             runnable=runnable,
         )
 
@@ -136,6 +136,59 @@ def project_runtime_readiness(
         projected["status"] = "degraded"
         projected["health"] = "degraded"
         projected["runtimeBlockers"] = required_blockers
+    return projected
+
+
+def project_runtime_failure(
+    descriptor: dict[str, object], provider_id: str, error: object
+) -> dict[str, object]:
+    """Fail closed when live runtime state cannot be verified."""
+
+    projected = deepcopy(descriptor)
+    message = str(error) or "runtime readiness check failed"
+    blocker = {"app": provider_id, "status": "error", "error": message}
+    projected["status"] = "disabled"
+    projected["health"] = "unavailable"
+    projected["runtimeReadiness"] = {
+        "id": provider_id,
+        "status": "error",
+        "apps": [],
+        "error": message,
+    }
+    projected["runtimeBlockers"] = [blocker]
+
+    capabilities = projected.get("capabilities")
+    if not isinstance(capabilities, list):
+        return projected
+
+    for capability in capabilities:
+        if not isinstance(capability, dict):
+            continue
+        model_schema = _model_schema(capability)
+        if model_schema is None:
+            capability["status"] = "disabled"
+            capability["runtimeBlockers"] = [blocker]
+            continue
+        declared_models = model_schema.get("enum")
+        if not isinstance(declared_models, list):
+            continue
+        capability["declaredModels"] = list(declared_models)
+        capability["modelReadiness"] = [
+            {
+                "model": model,
+                "app": provider_id,
+                "state": "error",
+                "runnable": False,
+                "deploymentStatus": "error",
+                "weightsStatus": "unknown",
+                "error": message,
+            }
+            for model in declared_models
+        ]
+        capability["readyModels"] = []
+        capability["status"] = "disabled"
+        capability["runtimeBlockers"] = [blocker]
+        model_schema["enum"] = []
     return projected
 
 
