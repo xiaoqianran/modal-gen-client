@@ -6,19 +6,20 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.116,<1",
     "httpx>=0.28,<1",
-    "modal-2d-client-agent",
-    "modal-3d-client",
-    "modal-2d",
-    "modal-3d",
+    "modal-2d[client]",
+    "modal-3d[client]",
     "modal-world",
     "modal-build",
     "uvicorn>=0.35,<1",
+    "PyJWT[crypto]>=2.10,<3",
+    "jsonschema>=4.23,<5",
 ]
 
 [project.scripts]
 modal-gen = "modal_gen.launcher:main"
 modal-gen-agent = "modal_gen.server:main"
 modal-gen-ui = "modal_gen.ui.server:main"
+modal-studio = "modal_gen.studio.app:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.12,<1"]
@@ -38,8 +39,6 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.uv.sources]
-modal-2d-client-agent = { path = "../modal-2D-client", editable = true }
-modal-3d-client = { path = "../modal-3D-client", editable = true }
 modal-2d = { path = "../modal-2D", editable = true }
 modal-3d = { path = "../modal-3D", editable = true }
 modal-world = { path = "../modal-world", editable = true }
