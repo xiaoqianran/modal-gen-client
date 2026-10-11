@@ -34,16 +34,16 @@ jobs:
           path: modal-2D
       - uses: actions/checkout@v7.0.1
         with:
-          repository: xiaoqianran/modal-2D-client
-          path: modal-2D-client
-      - uses: actions/checkout@v7.0.1
-        with:
           repository: xiaoqianran/modal-3D
           path: modal-3D
       - uses: actions/checkout@v7.0.1
         with:
-          repository: xiaoqianran/modal-3D-client
-          path: modal-3D-client
+          repository: xiaoqianran/modal-world
+          path: modal-world
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: xiaoqianran/modal-build
+          path: modal-build
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
